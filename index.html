@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <title>AI Video Auto Cutter</title>
+    <style>
+        /* CSS cơ bản - Bạn có thể tự do tùy chỉnh lại bằng tư duy thiết kế của mình */
+        body { font-family: system-ui, -apple-system, sans-serif; margin: 0; padding: 20px; background: #f9f9f9; color: #333; }
+        .container { max-width: 1000px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h1, h2 { color: #2c3e50; }
+        .step-section { display: none; } /* Ẩn các bước chưa tới */
+        .step-section.active { display: block; animation: fadeIn 0.5s; }
+        textarea { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
+        button { background: #007bff; color: white; border: none; padding: 10px 20px; cursor: pointer; border-radius: 4px; font-weight: bold; }
+        button:hover { background: #0056b3; }
+        button:disabled { background: #ccc; cursor: not-allowed; }
+        .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        .alert { padding: 15px; margin-bottom: 20px; border: 1px solid transparent; border-radius: 4px; }
+        .alert-warning { color: #856404; background-color: #fff3cd; border-color: #ffeeba; }
+        .alert-info { color: #0c5460; background-color: #d1ecf1; border-color: #bee5eb; }
+        #loading { display: none; margin-top: 10px; color: #007bff; font-weight: bold; }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>✂️ AI Video Auto Cutter</h1>
+
+    <div id="statusBox" style="display: none; background: #e9ecef; padding: 15px; border-radius: 5px; margin-bottom: 25px; font-weight: bold; color: #495057; border-left: 5px solid #007bff; box-shadow: 0 2px 4px rgba(0,0,0,0.05);">
+        ⏱️ Trạng thái hệ thống: <span id="statusText" style="color: #007bff;">Đang khởi tạo...</span>
+    </div>
+
+    <div id="step0" class="step-section active">
+        <h2>1. Cung cấp Dữ liệu Đầu vào</h2>
+        <div class="grid-2">
+            <div>
+                <label>Chọn các file video (.mp4, .mov):</label><br><br>
+                <input type="file" id="videoFiles" multiple accept=".mp4,.mov">
+            </div>
+            <div>
+                <label>Kịch bản Chuẩn (Reference Script):</label>
+                <textarea id="refScriptInput" rows="10" placeholder="Dán kịch bản chuẩn của bạn vào đây..."></textarea>
+            </div>
+        </div>
+        <br>
+        <button id="btnStartProcess">Bắt đầu ghép và xử lý Video</button>
+    </div>
+
+    <div id="step1" class="step-section">
+        <h2>2. Rà soát & Lọc kịch bản bằng AI</h2>
+        <div id="hallucinationWarning" class="alert alert-warning" style="display: none;">
+            ⚠️ Lưu ý: Dữ liệu vẫn còn dấu hiệu lặp từ/lặp câu do ảo giác của Whisper.
+        </div>
+        
+        <div class="grid-2">
+            <div>
+                <label>Phụ đề từ Video (Raw Transcript):</label>
+                <textarea id="rawTranscript" rows="15"></textarea>
+            </div>
+            <div>
+                <label>Kịch bản Chuẩn (Reference Script):</label>
+                <textarea id="refScriptReview" rows="15"></textarea> </div>
+        </div>
+        <br>
+        <button id="btnRetranscribe" style="background: #ffc107; color: #212529;">🔄 Bóc băng lại</button>
+        <button id="btnFilterLLM">🧠 Yêu cầu AI lọc các đoạn tốt nhất ➡️</button>
+    </div>
+
+    <div id="step2" class="step-section">
+        <h2>3. Kết quả lọc kịch bản</h2>
+        <textarea id="finalScript" rows="15" readonly></textarea>
+        <br><br>
+        <button id="btnBackToReview" style="background: #6c757d;">⬅️ Quay lại điều chỉnh</button>
+        <button id="btnDownload" style="background: #28a745;">💾 Tải Script (.txt)</button>
+        <button id="btnNewProject" style="background: #17a2b8; margin-left: 10px;">✨ Tạo dự án mới</button>
+    </div>
+</div>
+
+<script>
+    const API_BASE = "/api";
+    let statusInterval;
+
+    function startStatusPolling() {
+        document.getElementById('statusBox').style.display = 'block';
+        statusInterval = setInterval(async () => {
+            try {
+                const res = await fetch(`${API_BASE}/status`);
+                const data = await res.json();
+                document.getElementById('statusText').innerText = data.message;
+            } catch (e) { }
+        }, 1000);
+    }
+
+    function stopStatusPolling() {
+        clearInterval(statusInterval);
+        document.getElementById('statusBox').style.display = 'none';
+    }
+
+    function showStep(stepId) {
+        document.querySelectorAll('.step-section').forEach(el => el.classList.remove('active'));
+        document.getElementById(stepId).classList.add('active');
+    }
+
+    // HÀM LÕI ĐỂ CHẠY BÓC BĂNG (Dùng cho cả nút Bắt đầu và Bóc băng lại)
+    async function executeTranscription(isRetranscribe = false) {
+        const files = document.getElementById('videoFiles').files;
+        // Nếu bóc băng lại, lấy kịch bản từ ô Review (vì người dùng có thể đã sửa kịch bản ở Bước 1)
+        const refScript = isRetranscribe 
+            ? document.getElementById('refScriptReview').value 
+            : document.getElementById('refScriptInput').value;
+
+        if (files.length === 0 || !refScript.trim()) {
+            alert("Vui lòng đảm bảo đã chọn video và có kịch bản chuẩn!");
+            return;
+        }
+
+        const formData = new FormData();
+        for (let i = 0; i < files.length; i++) {
+            formData.append("files", files[i]);
+        }
+        formData.append("reference_script", refScript);
+
+        const btn = isRetranscribe ? document.getElementById('btnRetranscribe') : document.getElementById('btnStartProcess');
+        btn.disabled = true;
+        startStatusPolling();
+
+        try {
+            const response = await fetch(`${API_BASE}/transcribe`, { method: "POST", body: formData });
+            const data = await response.json();
+
+            if (data.status === "success") {
+                document.getElementById('rawTranscript').value = data.raw_text;
+                document.getElementById('refScriptReview').value = refScript;
+                
+                document.getElementById('hallucinationWarning').style.display = data.has_hallucination ? 'block' : 'none';
+                showStep('step1');
+            } else {
+                alert("Lỗi: " + data.detail);
+            }
+        } catch (error) {
+            alert("Lỗi kết nối đến server.");
+        } finally {
+            stopStatusPolling();
+            btn.disabled = false;
+        }
+    }
+
+    // Gán sự kiện cho các nút
+    document.getElementById('btnStartProcess').addEventListener('click', () => executeTranscription(false));
+    document.getElementById('btnRetranscribe').addEventListener('click', () => executeTranscription(true));
+
+    document.getElementById('btnFilterLLM').addEventListener('click', async () => {
+        const refScript = document.getElementById('refScriptReview').value;
+        const editedTranscript = document.getElementById('rawTranscript').value;
+
+        const formData = new FormData();
+        formData.append("reference_script", refScript);
+        formData.append("edited_transcript", editedTranscript);
+
+        document.getElementById('btnFilterLLM').disabled = true;
+        startStatusPolling();
+
+        try {
+            const response = await fetch(`${API_BASE}/filter`, { method: "POST", body: formData });
+            const data = await response.json();
+
+            if (data.status === "success") {
+                document.getElementById('finalScript').value = data.filtered_script;
+                showStep('step2');
+            } else {
+                alert("Lỗi từ LLM: " + data.detail);
+            }
+        } catch (error) {
+            alert("Không thể kết nối đến AI.");
+        } finally {
+            stopStatusPolling();
+            document.getElementById('btnFilterLLM').disabled = false;
+        }
+    });
+
+    document.getElementById('btnBackToReview').addEventListener('click', () => showStep('step1'));
+    
+    // SỰ KIỆN: Tạo dự án mới (Làm mới hoàn toàn trang web)
+    document.getElementById('btnNewProject').addEventListener('click', () => {
+        if (confirm("Bạn có chắc chắn muốn bắt đầu dự án mới? Toàn bộ dữ liệu hiện tại sẽ bị xóa.")) {
+            window.location.reload();
+        }
+    });
+
+    document.getElementById('btnDownload').addEventListener('click', () => {
+        const text = document.getElementById('finalScript').value;
+        const blob = new Blob([text], { type: "text/plain" });
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = "filtered_script.txt";
+        a.click();
+    });
+</script>
+</body>
+</html>
