@@ -9,8 +9,53 @@ import warnings
 import difflib
 import time  
 from pydub import AudioSegment
+import requests
+import json
 
 warnings.filterwarnings("ignore", category=UserWarning)
+
+def filter_segments_with_llm(reference_script, transcript_text, model_name="gemma4:e4b"):
+    """
+    Gửi prompt cho LLM để phân tích và chọn lọc các câu nói tốt nhất.
+    """
+    prompt = f"""
+    Bạn là một trợ lý chỉnh sửa video chuyên nghiệp.
+    Nhiệm vụ của bạn là đối chiếu 'Phụ đề Video thực tế' với 'Kịch bản Chuẩn'.
+    Người diễn thuyết có thể nói vấp, nói lại nhiều lần một đoạn. Hãy chọn ra những đoạn nói (takes) tốt nhất, trôi chảy nhất, không bị vấp, và sát với Kịch bản Chuẩn nhất để ghép thành một video hoàn chỉnh.
+
+    KỊCH BẢN CHUẨN:
+    {reference_script}
+
+    PHỤ ĐỀ VIDEO THỰC TẾ (Định dạng: [start - end | loudness] text):
+    {transcript_text}
+
+    YÊU CẦU ĐẦU RA:
+    1. CHỈ trả về danh sách các đoạn cần giữ lại.
+    2. GIỮ NGUYÊN định dạng timestamp [start - end] ở đầu mỗi dòng.
+    3. KHÔNG giải thích, KHÔNG thêm văn bản phụ trợ, KHÔNG dùng markdown code block.
+    
+    Kết quả mong đợi:
+    [0.00 - 2.50] Nội dung câu nói...
+    [5.00 - 8.20] Nội dung câu nói tiếp theo...
+    """
+    
+    url = "http://localhost:11434/api/generate"
+    payload = {
+        "model": model_name,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": 0.1 # Giữ temperature thấp để LLM không tự sáng tạo thêm từ
+        }
+    }
+    
+    try:
+        response = requests.post(url, json=payload)
+        response.raise_for_status()
+        result = response.json()
+        return result.get("response", "").strip()
+    except Exception as e:
+        return f"Lỗi khi kết nối với Ollama: {e}\n(Hãy đảm bảo Ollama đang chạy và đã tải model {model_name})"
 
 # --- CẤU HÌNH CƠ BẢN ---
 OUTPUT_VIDEO = "output_video.mp4"
@@ -65,7 +110,7 @@ def preprocess_audio_for_whisper(video_path):
     command = [
         "ffmpeg", "-y", "-i", video_path,
         "-vn", "-ac", "1", "-ar", "16000",
-        "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
+        "-af", "highpass=f=200,afftdn=nf=-25,loudnorm=I=-16:TP=-1.5:LRA=11",
         TEMP_AUDIO
     ]
     try:
@@ -132,6 +177,9 @@ def transcribe_audio(video_path, reference_script=""):
     device, _ = get_system_config()
     st.info("🎵 Đang làm sạch và chuẩn hóa âm thanh...")
     processed_audio = preprocess_audio_for_whisper(video_path)
+
+    # Tạo prompt mồi từ kịch bản chuẩn (lấy khoảng 500 ký tự đầu cho nhẹ)
+    prompt_moi = "Đây là video tiếng Việt. Từ vựng tham khảo: " + reference_script[:500]
     
     max_retries = 3
     final_cleaned_segments = []
@@ -153,10 +201,11 @@ def transcribe_audio(video_path, reference_script=""):
                 
             result = mlx_whisper.transcribe(
                 processed_audio,
-                path_or_hf_repo="mlx-community/whisper-large-v3-mlx",
+                path_or_hf_repo="mlx-community/whisper-large-v3-turbo",
                 language="vi",
                 word_timestamps=True,
-                temperature=current_temp 
+                temperature=current_temp,
+                initial_prompt=prompt_moi
             )
         else:
             if attempt == 0: st.info(f"🚀 Đang bóc băng bằng **OpenAI-Whisper** trên hệ thống {device.upper()}...")
@@ -167,7 +216,8 @@ def transcribe_audio(video_path, reference_script=""):
                 fp16=use_fp16, 
                 language="vi", 
                 word_timestamps=True,
-                temperature=current_temp
+                temperature=current_temp,
+                initial_prompt=prompt_moi
             )
         
         raw_segments = result['segments']
@@ -252,53 +302,6 @@ def merge_overlapping_segments(segments):
             merged.append(current.copy())
     return merged
 
-def match_segments_with_script(reference_script, segments, threshold=0.5, max_window=8):
-    ref_lines = split_sentences(reference_script)
-    selected_indices = set()
-    match_details = []
-
-    for ref_line in ref_lines:
-        best_score = 0
-        best_block = None
-        for i in range(len(segments)):
-            accumulated_text = ""
-            for j in range(i, min(i + max_window, len(segments))):
-                accumulated_text += " " + segments[j]['text'].strip()
-                accumulated_text = accumulated_text.strip()
-                score = difflib.SequenceMatcher(None, ref_line.lower(), accumulated_text.lower()).ratio()
-                if score >= best_score and score >= threshold:
-                    best_score = score
-                    best_block = {
-                        "start_idx": i, "end_idx": j,
-                        "text": accumulated_text, "score": score
-                    }
-        
-        if best_block is not None:
-            for idx in range(best_block["start_idx"], best_block["end_idx"] + 1):
-                selected_indices.add(idx)
-            start_time = segments[best_block["start_idx"]]['start']
-            end_time = segments[best_block["end_idx"]]['end']
-            match_details.append({
-                "ref_line": ref_line, "matched_text": best_block["text"],
-                "score": best_block["score"], "start": start_time, "end": end_time
-            })
-
-    raw_final_segments = [segments[i] for i in sorted(list(selected_indices))]
-    final_segments = merge_overlapping_segments(raw_final_segments)
-    return final_segments, match_details
-
-def build_ffmpeg_concat_file(good_segments):
-    filter_script = ""
-    for i, seg in enumerate(good_segments):
-        start = seg['start']
-        end = seg['end']
-        filter_script += f"[0:v]trim=start={start}:end={end},setpts=PTS-STARTPTS[v{i}]; "
-        filter_script += f"[0:a]atrim=start={start}:end={end},asetpts=PTS-STARTPTS[a{i}]; "
-    concat_str = "".join([f"[v{i}][a{i}]" for i in range(len(good_segments))])
-    filter_script += f"{concat_str}concat=n={len(good_segments)}:v=1:a=1[outv][outa]"
-    return filter_script
-
-
 # --- GIAO DIỆN STREAMLIT ---
 
 st.set_page_config(page_title="AI Video Auto Cutter", layout="wide")
@@ -361,106 +364,77 @@ if st.session_state.step == 0:
     elif uploaded_files:
         st.warning("Vui lòng nhập Kịch bản chuẩn trước khi bắt đầu!")
 
-# --- BƯỚC 1: ĐIỀU CHỈNH KỊCH BẢN & ĐỘ NHẠY ---
+# --- BƯỚC 1: RÀ SOÁT & TIẾN HÀNH LỌC BẰNG AI ---
 elif st.session_state.step == 1:
-    st.header("2. Rà soát & Đối chiếu kịch bản")
+    st.header("2. Rà soát & Lọc kịch bản bằng AI (Gemma)")
     
     mins = int(st.session_state.processing_time // 60)
     secs = int(st.session_state.processing_time % 60)
     st.success(f"⏱️ **Quá trình Tiền xử lý (Ghép File + Bóc Băng + Làm Sạch) hoàn tất trong: {mins} phút {secs} giây**")
     
     if st.session_state.has_hallucination:
-        st.warning("⚠️ **Lưu ý:** Dữ liệu cuối cùng vẫn còn dấu hiệu lặp từ/lặp câu do ảo giác của AI. Hãy kiểm tra và chỉnh sửa kỹ phụ đề bên dưới.")
+        st.warning("⚠️ **Lưu ý:** Dữ liệu vẫn còn dấu hiệu lặp từ/lặp câu do ảo giác của Whisper. Hãy kiểm tra phụ đề bên dưới.")
     else:
         st.success("✅ **Dữ liệu sạch:** Không phát hiện hiện tượng ảo giác ở lần bóc băng cuối cùng.")
 
     col1, col2 = st.columns(2)
     with col1:
         raw_text = format_segments_to_text(st.session_state.segments)
-        edited_text = st.text_area("Phụ đề từ Video (Đã được làm sạch tự động)", value=raw_text, height=350)
+        edited_text = st.text_area("Phụ đề từ Video (Raw Transcript)", value=raw_text, height=350)
         
-        if st.button("🔄 Trích xuất lại phụ đề (Không cần upload lại)"):
+        if st.button("🔄 Trích xuất lại phụ đề"):
             start_time = time.time()
-            with st.spinner("Đang trích xuất và làm sạch lại từ file video đã lưu..."):
+            with st.spinner("Đang trích xuất lại..."):
                 st.session_state.segments, st.session_state.has_hallucination = transcribe_audio(st.session_state.video_path, st.session_state.reference_script)
                 st.session_state.processing_time = time.time() - start_time
                 st.rerun()
     
     with col2:
-        st.session_state.reference_script = st.text_area("Kịch bản Chuẩn (Có thể sửa lại nếu cần)", value=st.session_state.reference_script, height=280)
-        st.info("Hệ thống tự động nối các đoạn nhỏ lại với nhau để tối đa hóa độ trùng khớp.")
-        st.session_state.threshold = st.slider("Độ chính xác tối thiểu (Threshold)", 0.1, 1.0, st.session_state.threshold, 0.05)
+        st.session_state.reference_script = st.text_area("Kịch bản Chuẩn (Reference Script)", value=st.session_state.reference_script, height=350)
 
+    st.divider()
+    
     col_btn1, col_btn2 = st.columns(2)
     with col_btn1:
-        if st.button("⬅️ Làm lại từ đầu (Xóa hết Video & Kịch bản)"):
+        if st.button("⬅️ Làm lại từ đầu"):
             for key in list(st.session_state.keys()): del st.session_state[key]
             st.rerun()
     with col_btn2:
-        if st.button("Tiến hành Đối chiếu & Xem kết quả ➡️", type="primary"):
-            st.session_state.segments = parse_text_to_segments(edited_text)
-            final_segs, details = match_segments_with_script(st.session_state.reference_script, st.session_state.segments, st.session_state.threshold)
-            st.session_state.good_segments = final_segs
-            st.session_state.match_details = details
+        if st.button("🧠 Yêu cầu Gemma lọc các đoạn tốt nhất ➡️", type="primary"):
+            st.session_state.edited_transcript = edited_text
             st.session_state.step = 2
             st.rerun()
 
-# --- BƯỚC 2: XÁC NHẬN & RENDER ---
+# --- BƯỚC 2: KẾT QUẢ TỪ LLM ---
 elif st.session_state.step == 2:
-    st.header("3. Kết quả đối chiếu")
+    st.header("3. Kết quả lọc kịch bản từ AI")
     
-    if len(st.session_state.good_segments) == 0:
-        st.warning("Không tìm thấy đoạn nào khớp. Hãy quay lại hạ độ nhạy hoặc kiểm tra kịch bản có đủ dấu chấm câu chưa.")
-        if st.button("⬅️ Quay lại điều chỉnh"):
+    with st.spinner("Đang gửi dữ liệu cho mô hình gemma4:e4b phân tích. Vui lòng đợi..."):
+        # Gọi hàm LLM
+        final_script = filter_segments_with_llm(
+            reference_script=st.session_state.reference_script,
+            transcript_text=st.session_state.edited_transcript,
+            model_name="gemma4:e4b"
+        )
+    
+    if "Lỗi khi kết nối" in final_script:
+        st.error(final_script)
+        if st.button("⬅️ Quay lại"):
             st.session_state.step = 1
             st.rerun()
     else:
-        st.success(f"Tìm thấy tổ hợp hoàn chỉnh. Đã gộp thành {len(st.session_state.good_segments)} cảnh quay lớn.")
-        with st.expander("Xem chi tiết các đoạn sẽ được giữ lại", expanded=True):
-            for detail in st.session_state.match_details:
-                st.write(f"**Gốc:** {detail['ref_line']} \n\n **→ Tổ hợp Video:** `[{detail['start']:.2f} - {detail['end']:.2f}]` {detail['matched_text']} *(Độ khớp: {detail['score']:.2f})*")
-                st.divider()
+        st.success("🎉 AI đã hoàn tất việc lọc các đoạn (takes) tốt nhất!")
+        st.text_area("Kịch bản & Timestamp đã lọc", value=final_script, height=400)
         
         col1, col2 = st.columns(2)
         with col1:
-            if st.button("⬅️ Quay lại điều chỉnh (Sửa phụ đề / Hạ độ nhạy)"):
+            if st.button("⬅️ Quay lại điều chỉnh"):
                 st.session_state.step = 1
                 st.rerun()
         with col2:
-            if st.button("🎬 Bắt đầu Cắt Video", type="primary"):
-                with st.spinner("Đang Render. Quá trình này có thể mất vài phút..."):
-                    filter_complex = build_ffmpeg_concat_file(st.session_state.good_segments)
-                    subprocess.run(
-                        [
-                            "ffmpeg", "-y", "-i", st.session_state.video_path, 
-                            "-filter_complex", filter_complex, 
-                            "-map", "[outv]", "-map", "[outa]", 
-                            "-c:v", encoder, 
-                            "-pix_fmt", "yuv420p", 
-                            "-c:a", "aac", OUTPUT_VIDEO
-                        ], 
-                        check=True
-                    )
-                    st.session_state.step = 3
-                    st.rerun()
-
-# --- BƯỚC 3: HOÀN TẤT & ĐIỀU CHỈNH LẠI ---
-elif st.session_state.step == 3:
-    st.header("4. Hoàn tất!")
-    if os.path.exists(OUTPUT_VIDEO):
-        st.video(OUTPUT_VIDEO)
-        
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            with open(OUTPUT_VIDEO, "rb") as file:
-                st.download_button("💾 Tải Video Xuất Ra", data=file, file_name="edited_video.mp4", mime="video/mp4")
-        with col2:
-            if st.button("🔄 Quay lại điều chỉnh mức độ cắt (Không mất dữ liệu)"):
-                st.session_state.step = 1
-                st.session_state.good_segments = []
-                st.session_state.match_details = []
-                st.rerun()
-        with col3:
-            if st.button("🗑️ Bắt đầu Dự án Mới"):
-                for key in list(st.session_state.keys()): del st.session_state[key]
-                st.rerun()
+            st.download_button(
+                label="💾 Tải Script (.txt)",
+                data=final_script,
+                file_name="filtered_script_with_timestamps.txt",
+                mime="text/plain"
+            )
