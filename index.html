@@ -27,6 +27,12 @@
 <div class="container">
     <h1>✂️ AI Video Auto Cutter</h1>
 
+    <div id="hardwareInfoBar" style="display: flex; gap: 20px; background: #f0f2f5; padding: 10px; border-radius: 5px; margin-bottom: 15px; font-size: 0.9em; border: 1px solid #ddd;">
+        <div>💻 <b>Hệ điều hành:</b> <span id="osText">...</span></div>
+        <div>🎨 <b>Card đồ họa:</b> <span id="gpuText">...</span></div>
+        <div>⚡ <b>Chế độ chạy:</b> <span id="deviceText" style="color: #28a745; font-weight: bold;">...</span></div>
+    </div>
+
     <div id="statusBox" style="display: none; background: #e9ecef; padding: 15px; border-radius: 5px; margin-bottom: 25px; font-weight: bold; color: #495057; border-left: 5px solid #007bff; box-shadow: 0 2px 4px rgba(0,0,0,0.05);">
         ⏱️ Trạng thái hệ thống: <span id="statusText" style="color: #007bff;">Đang khởi tạo...</span>
     </div>
@@ -37,6 +43,13 @@
             <div>
                 <label>Chọn các file video (.mp4, .mov):</label><br><br>
                 <input type="file" id="videoFiles" multiple accept=".mp4,.mov">
+                <br><br>
+                <label>Chế độ xử lý âm thanh cho Whisper:</label><br><br>
+                <select id="transcribeMode" style="padding: 8px; border-radius: 4px; border: 1px solid #ccc;">
+                    <option value="vi_smart" selected>VI Smart (khuyến nghị, giảm ảo giác)</option>
+                    <option value="hq">HQ (nặng hơn, denoise mạnh)</option>
+                    <option value="fast">Fast (nhanh)</option>
+                </select>
             </div>
             <div>
                 <label>Kịch bản Chuẩn (Reference Script):</label>
@@ -48,10 +61,11 @@
     </div>
 
     <div id="step1" class="step-section">
-        <h2>2. Rà soát & Lọc kịch bản bằng AI</h2>
+        <h2>2. Rà soát & Lọc kịch bản theo Pipeline</h2>
         <div id="hallucinationWarning" class="alert alert-warning" style="display: none;">
             ⚠️ Lưu ý: Dữ liệu vẫn còn dấu hiệu lặp từ/lặp câu do ảo giác của Whisper.
         </div>
+        <div id="transcribeModeInfo" class="alert alert-info" style="display: none;"></div>
         
         <div class="grid-2">
             <div>
@@ -64,7 +78,7 @@
         </div>
         <br>
         <button id="btnRetranscribe" style="background: #ffc107; color: #212529;">🔄 Bóc băng lại</button>
-        <button id="btnFilterLLM">🧠 Yêu cầu AI lọc các đoạn tốt nhất ➡️</button>
+        <button id="btnFilterLLM">⚙️ Lọc các đoạn tốt nhất ➡️</button>
     </div>
 
     <div id="step2" class="step-section">
@@ -73,6 +87,9 @@
         <br><br>
         <button id="btnBackToReview" style="background: #6c757d;">⬅️ Quay lại điều chỉnh</button>
         <button id="btnDownload" style="background: #28a745;">💾 Tải Script (.txt)</button>
+        <button id="btnDownloadEdl" style="background: #fd7e14; margin-left: 10px;">🎬 Tải Timeline (.edl)</button>
+        <button id="btnDownloadXml" style="background: #20c997; margin-left: 10px;">🗂️ Tải Timeline (.xml)</button>
+        <button id="btnExportVideo" style="background: #dc3545; margin-left: 10px;">🎞️ Xuất Video Hoàn Chỉnh</button>
         <button id="btnNewProject" style="background: #17a2b8; margin-left: 10px;">✨ Tạo dự án mới</button>
     </div>
 </div>
@@ -80,6 +97,12 @@
 <script>
     const API_BASE = "/api";
     let statusInterval;
+    let latestEdl = "";
+    let latestXml = "";
+    let latestTimeline = [];
+    let latestTimelineScriptOrder = [];
+    let latestTimelineTimeOrder = [];
+    let latestFilteredRows = [];
 
     function startStatusPolling() {
         document.getElementById('statusBox').style.display = 'block';
@@ -120,6 +143,7 @@
             formData.append("files", files[i]);
         }
         formData.append("reference_script", refScript);
+        formData.append("transcribe_mode", document.getElementById('transcribeMode').value || "vi_smart");
 
         const btn = isRetranscribe ? document.getElementById('btnRetranscribe') : document.getElementById('btnStartProcess');
         btn.disabled = true;
@@ -134,6 +158,9 @@
                 document.getElementById('refScriptReview').value = refScript;
                 
                 document.getElementById('hallucinationWarning').style.display = data.has_hallucination ? 'block' : 'none';
+                const modeInfo = document.getElementById('transcribeModeInfo');
+                modeInfo.style.display = 'block';
+                modeInfo.innerText = `Chế độ xử lý âm thanh đã dùng: ${data.transcribe_mode_used || "vi_smart"}`;
                 showStep('step1');
             } else {
                 alert("Lỗi: " + data.detail);
@@ -167,12 +194,18 @@
 
             if (data.status === "success") {
                 document.getElementById('finalScript').value = data.filtered_script;
+                latestEdl = data.edl || "";
+                latestXml = data.timeline_xml || "";
+                latestFilteredRows = data.filtered_rows || [];
+                latestTimelineScriptOrder = data.timeline_script_order || data.timeline || [];
+                latestTimelineTimeOrder = data.timeline_time_order || [];
+                latestTimeline = latestTimelineScriptOrder;
                 showStep('step2');
             } else {
-                alert("Lỗi từ LLM: " + data.detail);
+                alert("Lỗi lọc transcript: " + data.detail);
             }
         } catch (error) {
-            alert("Không thể kết nối đến AI.");
+            alert("Không thể kết nối đến server.");
         } finally {
             stopStatusPolling();
             document.getElementById('btnFilterLLM').disabled = false;
@@ -184,7 +217,10 @@
     // SỰ KIỆN: Tạo dự án mới (Làm mới hoàn toàn trang web)
     document.getElementById('btnNewProject').addEventListener('click', () => {
         if (confirm("Bạn có chắc chắn muốn bắt đầu dự án mới? Toàn bộ dữ liệu hiện tại sẽ bị xóa.")) {
-            window.location.reload();
+            fetch(`${API_BASE}/reset-project`, { method: "POST" })
+                .finally(() => {
+                    window.location.reload();
+                });
         }
     });
 
@@ -196,6 +232,80 @@
         a.download = "filtered_script.txt";
         a.click();
     });
+
+    document.getElementById('btnDownloadEdl').addEventListener('click', () => {
+        if (!latestEdl.trim()) {
+            alert("Chưa có dữ liệu EDL. Hãy chạy bước lọc trước.");
+            return;
+        }
+        const blob = new Blob([latestEdl], { type: "text/plain" });
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = "timeline.edl";
+        a.click();
+    });
+
+    document.getElementById('btnDownloadXml').addEventListener('click', () => {
+        if (!latestXml.trim()) {
+            alert("Chưa có dữ liệu XML. Hãy chạy bước lọc trước.");
+            return;
+        }
+        const blob = new Blob([latestXml], { type: "application/xml" });
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = "timeline.xml";
+        a.click();
+    });
+
+    document.getElementById('btnExportVideo').addEventListener('click', async () => {
+        if (!Array.isArray(latestTimelineScriptOrder) || latestTimelineScriptOrder.length === 0) {
+            alert("Chưa có timeline để xuất video. Hãy chạy bước lọc trước.");
+            return;
+        }
+
+        const formData = new FormData();
+        formData.append("timeline_json", JSON.stringify(latestTimelineScriptOrder));
+        const btn = document.getElementById('btnExportVideo');
+        btn.disabled = true;
+        startStatusPolling();
+
+        try {
+            const response = await fetch(`${API_BASE}/export-video`, {
+                method: "POST",
+                body: formData
+            });
+            if (!response.ok) {
+                const err = await response.json();
+                throw new Error(err.detail || "Không thể xuất video.");
+            }
+
+            const blob = await response.blob();
+            const a = document.createElement("a");
+            a.href = URL.createObjectURL(blob);
+            a.download = "final_cut.mp4";
+            a.click();
+        } catch (error) {
+            alert(error.message || "Lỗi khi xuất video.");
+        } finally {
+            stopStatusPolling();
+            btn.disabled = false;
+        }
+    });
+
+    async function loadHardwareInfo() {
+        try {
+            const res = await fetch(`${API_BASE}/hardware-info`);
+            const data = await res.json();
+            document.getElementById('osText').innerText = data.os;
+            document.getElementById('gpuText').innerText = data.gpu;
+            document.getElementById('deviceText').innerText = data.device;
+        } catch (e) {
+            console.error("Không thể lấy thông tin phần cứng");
+        }
+    }
+
+    // Gọi hàm này ngay khi trang web tải xong
+    window.addEventListener('load', loadHardwareInfo);
 </script>
 </body>
 </html>
