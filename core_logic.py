@@ -662,16 +662,35 @@ def preprocess_transcript_segments(
     if not kept:
         return []
 
-    # [MỚI] Hàm lấy danh sách từ (words) thay vì lấy cả câu
+       # [MỚI] Hàm lấy danh sách từ (words) thay vì lấy cả câu
     def _extract_sub_segments(seg: Dict[str, Any]) -> List[Dict[str, Any]]:
         if "word_level_data" in seg and seg["word_level_data"]:
             return seg["word_level_data"]
-        return [{
-            "start": float(seg["start"]),
-            "end": float(seg["end"]),
-            "text": seg["text"],
-            "loudness_dBFS": float(seg.get("loudness_dBFS", 0.0)),
-        }]
+        
+        # ---- FIX CỐT LÕI: PSEUDO-WORD TIMESTAMPS ----
+        # Nếu mất dữ liệu json hoặc Whisper gộp câu quá dài thành 1 cục,
+        # tự động chia nhỏ mốc thời gian đều cho từng chữ để "dao mổ" luôn có dữ liệu cắt.
+        text = str(seg.get("text", "")).strip()
+        words = text.split()
+        if not words:
+            return []
+            
+        start = float(seg["start"])
+        end = float(seg["end"])
+        duration = max(0.0, end - start)
+        word_dur = duration / len(words) if len(words) > 0 else 0
+        loudness = float(seg.get("loudness_dBFS", 0.0))
+        
+        subs = []
+        for i, w in enumerate(words):
+            subs.append({
+                "start": start + i * word_dur,
+                "end": start + (i + 1) * word_dur,
+                "text": w,
+                "loudness_dBFS": loudness
+            })
+        return subs
+        # ----------------------------------------------
 
     merged: List[Dict[str, Any]] = []
     
@@ -744,8 +763,49 @@ def _partial_ratio(text_a: str, text_b: str) -> float:
         best = SequenceMatcher(None, shorter, longer).ratio()
     return best
 
+def _check_number_consistency(script_text: str, raw_text: str) -> bool:
+    """
+    Luật thép Nâng cấp: Các con số trong kịch bản phải xuất hiện 
+    ĐÚNG THỨ TỰ và LIÊN TIẾP NHAU trong audio thực tế.
+    """
+    def extract_nums(text: str) -> list:  # Sửa từ set sang list để giữ đúng thứ tự
+        t = text.lower()
+        # Xóa dấu phẩy và chấm giữa các con số (VD: 1.000 -> 1000, 1,7 -> 17)
+        t = re.sub(r'(\d)[.,](\d)', r'\1\2', t)
+        
+        # Chuyển đổi các chữ số cơ bản thành số
+        num_map = {
+            r'\bmười một\b': '11', r'\bmười hai\b': '12',
+            r'\bmột\b': '1', r'\bhai\b': '2', r'\bba\b': '3', r'\bbốn\b': '4',
+            r'\bnăm\b': '5', r'\bsáu\b': '6', r'\bbảy\b': '7', r'\btám\b': '8',
+            r'\bchín\b': '9', r'\bmười\b': '10'
+        }
+        for pat, repl in num_map.items():
+            t = re.sub(pat, repl, t)
+            
+        return re.findall(r'\d+', t)
+
+    script_nums = extract_nums(script_text)
+    if not script_nums:
+        return True # Không có số -> Pass
+        
+    raw_nums = extract_nums(raw_text)
+    
+    # ---- FIX MỚI: KIỂM TRA CHUỖI LIÊN TIẾP (Sub-list Matching) ----
+    n = len(script_nums)
+    # Lướt một "cửa sổ" qua danh sách số thực tế để tìm chuỗi khớp hoàn toàn
+    for i in range(len(raw_nums) - n + 1):
+        if raw_nums[i:i+n] == script_nums:
+            return True
+            
+    return False
+    # ---------------------------------------------------------------
 
 def _similarity(a: str, b: str) -> float:
+    # --- ÁP DỤNG LUẬT THÉP ---
+    if not _check_number_consistency(a, b):
+        return 0.0
+
     norm_a = _normalize_for_match(a)
     norm_b = _normalize_for_match(b)
     if not norm_a or not norm_b:
@@ -1047,6 +1107,10 @@ def _clamp(value: float, lower: float, upper: float) -> float:
 
 
 def _token_coverage(script_text: str, transcript_text: str) -> float:
+    # --- ÁP DỤNG LUẬT THÉP ---
+    if not _check_number_consistency(script_text, transcript_text):
+        return 0.0
+    # -------------------------
     script_tokens = set(_strip_diacritics(_normalize_for_match(script_text)).split())
     transcript_tokens = set(_strip_diacritics(_normalize_for_match(transcript_text)).split())
     if not script_tokens:
@@ -1352,7 +1416,7 @@ def _subsegment_span_candidates(
             
             # CẢI TIẾN: Thưởng điểm nếu lấy đủ 100% từ vựng cốt lõi -> Chống lẹm đầu lẹm đuôi
             if token_coverage >= 0.95:
-                score += 0.04
+                score += 0.06
 
             candidates.append({
                 "start": span_start,
