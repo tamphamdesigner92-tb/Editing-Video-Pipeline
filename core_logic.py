@@ -4,6 +4,7 @@ import re
 import subprocess
 import unicodedata
 import warnings
+import json
 from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -90,6 +91,35 @@ FILLER_WORDS = {
     "mà",
     "ơi",
 }
+
+def restore_word_timestamps(parsed_segments: List[Dict[str, Any]], session_file: str) -> List[Dict[str, Any]]:
+    """Đọc file local để lấy lại word-timestamps và map vào các segment từ UI"""
+    if not os.path.exists(session_file):
+        return parsed_segments
+
+    try:
+        with open(session_file, "r", encoding="utf-8") as f:
+            raw_data = json.load(f)
+    except Exception:
+        return parsed_segments
+
+    for p_seg in parsed_segments:
+        p_start = p_seg["start"]
+        for r_seg in raw_data:
+            # Tìm segment gốc trùng khớp (dung sai 0.1s)
+            if abs(r_seg.get("start", -1) - p_start) < 0.1:
+                if "words" in r_seg and r_seg["words"]:
+                    p_seg["word_level_data"] = [
+                        {
+                            "start": float(w.get("start", p_start)),
+                            "end": float(w.get("end", p_seg["end"])),
+                            "text": str(w.get("word", "")).strip(),
+                            "loudness_dBFS": float(p_seg.get("loudness_dBFS", 0.0))
+                        }
+                        for w in r_seg["words"]
+                    ]
+                break
+    return parsed_segments
 
 def get_detailed_hardware_info() -> Dict[str, str]:
     sys_os = platform.system() # Windows, Darwin (Mac), Linux
@@ -205,24 +235,17 @@ def preprocess_audio_for_whisper(video_path: str, mode: str = "vi_smart") -> Tup
 
 
 def split_sentences(text: str) -> List[str]:
+    # Thay thế ký tự xuống dòng và chuẩn hóa khoảng trắng
     normalized = re.sub(r"\s+", " ", text.replace("\r", "\n")).strip()
     if not normalized:
         return []
 
+    # Chỉ cắt tách câu dựa trên dấu kết thúc câu (. ! ?) hoặc xuống dòng
     primary_parts = re.split(r"(?<=[.!?])\s+|\n+", normalized)
     primary_sentences = [p.strip(" \t-•") for p in primary_parts if p.strip()]
 
-    refined: List[str] = []
-    for sent in primary_sentences:
-        if len(sent.split()) > 18 and "," in sent:
-            clauses = [c.strip(" \t-•") for c in sent.split(",") if c.strip()]
-            usable_clauses = [c for c in clauses if len(c.split()) >= 4]
-            if usable_clauses:
-                refined.extend(usable_clauses)
-                continue
-        refined.append(sent)
-
-    return [s for s in refined if len(s.split()) >= 4]
+    # Trả về các câu có từ 3 chữ trở lên, KHÔNG cắt vụn theo dấu phẩy nữa
+    return [s for s in primary_sentences if len(s.split()) >= 3]
 
 
 def check_repeating_words(segments: List[Dict[str, Any]]) -> bool:
@@ -621,10 +644,10 @@ def preprocess_transcript_segments(
     segments: List[Dict[str, Any]],
     min_duration: float = 0.6,
     min_words: int = 2,
-    max_gap: float = 0.8,
+    max_gap: float = 0.35,
 ) -> List[Dict[str, Any]]:
     kept: List[Dict[str, Any]] = []
-    for seg in segments:
+    for source_index, seg in enumerate(segments):
         duration = seg["end"] - seg["start"]
         word_count = len(seg["text"].split())
 
@@ -633,37 +656,57 @@ def preprocess_transcript_segments(
         if duration < min_duration and word_count < min_words:
             continue
 
-        kept.append(seg)
+        seg_copy = dict(seg)
+        seg_copy["_source_index"] = source_index
+        kept.append(seg_copy)
 
     if not kept:
         return []
 
+    # [MỚI] Hàm lấy danh sách từ (words) thay vì lấy cả câu
+    def _extract_sub_segments(seg: Dict[str, Any]) -> List[Dict[str, Any]]:
+        if "word_level_data" in seg and seg["word_level_data"]:
+            return seg["word_level_data"]
+        return [{
+            "start": float(seg["start"]),
+            "end": float(seg["end"]),
+            "text": seg["text"],
+            "loudness_dBFS": float(seg.get("loudness_dBFS", 0.0)),
+        }]
+
     merged: List[Dict[str, Any]] = []
+    
     current = dict(kept[0])
+    current["sub_segments"] = _extract_sub_segments(kept[0]) # Cập nhật
 
     for seg in kept[1:]:
         gap = seg["start"] - current["end"]
-        # Không gộp 2 đoạn quá giống nhau để giữ retake tách biệt cho bước Last Best Take.
-        if gap <= max_gap and not _is_retake_like_pair(current["text"], seg["text"]):
+        last_sub_text = current.get("sub_segments", [{}])[-1].get("text", current.get("text", ""))
+        
+        if gap <= max_gap and not _is_retake_like_pair(last_sub_text, seg["text"]):
             old_duration = current["end"] - current["start"]
             new_duration = seg["end"] - seg["start"]
             total_duration = old_duration + new_duration
-            if total_duration > 0:
-                weighted_loudness = (
-                    current.get("loudness_dBFS", 0.0) * old_duration
-                    + seg.get("loudness_dBFS", 0.0) * new_duration
-                ) / total_duration
-            else:
-                weighted_loudness = current.get("loudness_dBFS", 0.0)
+            
+            weighted_loudness = (current.get("loudness_dBFS", 0.0) * old_duration + 
+                                 seg.get("loudness_dBFS", 0.0) * new_duration) / total_duration if total_duration > 0 else current.get("loudness_dBFS", 0.0)
 
             current["end"] = seg["end"]
             current["text"] = f"{current['text']} {seg['text']}".strip()
             current["loudness_dBFS"] = weighted_loudness
+            # [CẬP NHẬT] Nối trực tiếp mảng các từ vào sub_segments
+            current.setdefault("sub_segments", []).extend(_extract_sub_segments(seg))
         else:
             merged.append(current)
             current = dict(seg)
+            current["sub_segments"] = _extract_sub_segments(seg) # Cập nhật
 
     merged.append(current)
+
+    for chunk in merged:
+        chunk.pop("_source_index", None)
+        chunk.pop("word_level_data", None)
+
     return merged
 
 
@@ -828,12 +871,14 @@ def apply_last_best_take(
     refined: List[Tuple[int, int, float]] = []
 
     for idx, (script_idx, chunk_idx, original_score) in enumerate(matches):
-        left_bound = matches[idx - 1][1] + 1 if idx > 0 else 0
-        right_bound = matches[idx + 1][1] - 1 if idx < len(matches) - 1 else len(chunks) - 1
-
-        if left_bound > right_bound:
-            refined.append((script_idx, chunk_idx, original_score))
-            continue
+        # FIX: Nới lỏng boundary. Cho phép cùng nằm trên 1 chunk (left_bound) 
+        # và mở rộng tầm nhìn ra xa hơn (+15 chunks) để bắt được retake cuối cùng.
+        left_bound = matches[idx - 1][1] if idx > 0 else 0
+        
+        if idx < len(matches) - 1:
+            right_bound = min(len(chunks) - 1, matches[idx + 1][1] + 15)
+        else:
+            right_bound = len(chunks) - 1
 
         candidates: List[Tuple[int, float]] = []
         cutoff = max(match_threshold - 0.07, 0.63)
@@ -846,6 +891,7 @@ def apply_last_best_take(
             refined.append((script_idx, chunk_idx, original_score))
             continue
 
+        # Gom nhóm các retake
         clusters: List[List[Tuple[int, float]]] = []
         for cand in candidates:
             if not clusters:
@@ -854,24 +900,66 @@ def apply_last_best_take(
 
             prev_idx = clusters[-1][-1][0]
             time_gap = chunks[cand[0]]["start"] - chunks[prev_idx]["end"]
-            if time_gap <= retake_cluster_gap_sec:
+            
+            # Cho phép gom nhóm nếu khoảng cách thời gian ngắn hoặc sát index nhau
+            if time_gap <= retake_cluster_gap_sec or (cand[0] - prev_idx <= 2):
                 clusters[-1].append(cand)
             else:
                 clusters.append([cand])
 
-        target_cluster = None
-        for cluster in clusters:
-            if any(c[0] == chunk_idx for c in cluster):
-                target_cluster = cluster
-                break
-        if target_cluster is None:
-            target_cluster = min(clusters, key=lambda c: abs(c[-1][0] - chunk_idx))
+        # FIX: Luôn target vào cụm cuối cùng (Take cuối)
+        target_cluster = clusters[-1]
 
         cluster_best = max(score for _, score in target_cluster)
         acceptable = [c for c in target_cluster if c[1] >= cluster_best - 0.10]
         chosen_idx, chosen_score = acceptable[-1] if acceptable else target_cluster[-1]
 
         refined.append((script_idx, chosen_idx, chosen_score))
+
+    # FIX: Ép tính tuần tự thời gian (Monotonic) để tránh hiện tượng câu sau lại nhảy về trước câu trước
+    for i in range(1, len(refined)):
+        if refined[i][1] < refined[i - 1][1]:
+            refined[i] = (refined[i][0], refined[i - 1][1], refined[i][2])
+
+    # Hậu kiểm overlap nội dung giữa các câu kề nhau
+    overlap_threshold = 0.86
+    min_pair_match = max(match_threshold - 0.07, 0.35)
+    for i in range(1, len(refined)):
+        prev_script_idx, prev_chunk_idx, _ = refined[i - 1]
+        curr_script_idx, curr_chunk_idx, _ = refined[i]
+
+        if prev_script_idx + 1 != curr_script_idx:
+            continue
+        if prev_chunk_idx == curr_chunk_idx:
+            continue
+
+        chunk_overlap = _similarity(chunks[prev_chunk_idx]["text"], chunks[curr_chunk_idx]["text"])
+        if chunk_overlap < overlap_threshold:
+            continue
+
+        prev_chunk_prev_sim = _similarity(script_sentences[prev_script_idx], chunks[prev_chunk_idx]["text"])
+        prev_chunk_curr_sim = _similarity(script_sentences[curr_script_idx], chunks[prev_chunk_idx]["text"])
+        curr_chunk_prev_sim = _similarity(script_sentences[prev_script_idx], chunks[curr_chunk_idx]["text"])
+        curr_chunk_curr_sim = _similarity(script_sentences[curr_script_idx], chunks[curr_chunk_idx]["text"])
+
+        use_prev_ok = min(prev_chunk_prev_sim, prev_chunk_curr_sim) >= min_pair_match
+        use_curr_ok = min(curr_chunk_prev_sim, curr_chunk_curr_sim) >= min_pair_match
+        if not use_prev_ok and not use_curr_ok:
+            continue
+
+        prev_pair_score = prev_chunk_prev_sim + prev_chunk_curr_sim
+        curr_pair_score = curr_chunk_prev_sim + curr_chunk_curr_sim
+        if use_curr_ok and (not use_prev_ok or curr_pair_score >= prev_pair_score):
+            chosen_chunk = curr_chunk_idx
+            chosen_prev_sim = curr_chunk_prev_sim
+            chosen_curr_sim = curr_chunk_curr_sim
+        else:
+            chosen_chunk = prev_chunk_idx
+            chosen_prev_sim = prev_chunk_prev_sim
+            chosen_curr_sim = prev_chunk_curr_sim
+
+        refined[i - 1] = (prev_script_idx, chosen_chunk, chosen_prev_sim)
+        refined[i] = (curr_script_idx, chosen_chunk, chosen_curr_sim)
 
     return refined
 
@@ -1182,7 +1270,79 @@ def _expand_n_to_one_matches(
     return matched_rows, n_to_one_shared_chunks
 
 
-def _split_shared_chunk_intervals(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _subsegment_span_candidates(
+    script_text: str,
+    sub_segments: List[Dict[str, Any]],
+    max_window: int = 40,
+    max_span_sec: float = 12.0,
+) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+    n = len(sub_segments)
+    if n == 0:
+        return candidates
+
+    for i in range(n):
+        span_text_parts: List[str] = []
+        loud_sum = 0.0
+        dur_sum = 0.0
+        span_start = float(sub_segments[i]["start"])
+        span_end = span_start
+
+        for j in range(i, min(n, i + max_window)):
+            sub = sub_segments[j]
+            seg_text = str(sub.get("text", "")).strip()
+            if not seg_text:
+                continue
+
+            span_text_parts.append(seg_text)
+            span_end = float(sub["end"])
+            sub_duration = max(0.0, float(sub["end"]) - float(sub["start"]))
+            loud_sum += float(sub.get("loudness_dBFS", 0.0)) * sub_duration
+            dur_sum += sub_duration
+
+            if span_end - span_start > max_span_sec:
+                break
+
+            span_text = " ".join(span_text_parts).strip()
+            if not span_text:
+                continue
+
+            loudness = (loud_sum / dur_sum) if dur_sum > 0 else float(sub.get("loudness_dBFS", 0.0))
+            similarity = _similarity(script_text, span_text)
+            token_coverage = _token_coverage(script_text, span_text)
+            score = _final_match_score(similarity, token_coverage, loudness)
+            candidates.append(
+                {
+                    "start": span_start,
+                    "end": span_end,
+                    "text": span_text,
+                    "loudness_dBFS": loudness,
+                    "similarity": similarity,
+                    "token_coverage": token_coverage,
+                    "score": score,
+                }
+            )
+
+    candidates.sort(
+        key=lambda c: (
+            c["score"],
+            c["similarity"],
+            c["token_coverage"],
+            -(c["end"] - c["start"]),
+        ),
+        reverse=True,
+    )
+    return candidates
+
+
+def _interval_overlap(a_start: float, a_end: float, b_start: float, b_end: float) -> float:
+    return max(0.0, min(a_end, b_end) - max(a_start, b_start))
+
+
+def _rematch_shared_chunk_intervals(
+    rows: List[Dict[str, Any]],
+    chunks_by_index: Dict[int, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
     if not rows:
         return []
 
@@ -1196,35 +1356,68 @@ def _split_shared_chunk_intervals(rows: List[Dict[str, Any]]) -> List[Dict[str, 
         if chunk_idx < 0 or len(row_indices) <= 1:
             continue
 
-        ordered = sorted(row_indices, key=lambda i: output[i]["script_index"])
-        chunk_start = min(float(output[i]["start"]) for i in ordered)
-        chunk_end = max(float(output[i]["end"]) for i in ordered)
-        total_duration = max(0.001, chunk_end - chunk_start)
+        chunk = chunks_by_index.get(chunk_idx, {})
+        sub_segments = list(chunk.get("sub_segments", []))
+        if not sub_segments:
+            continue
 
-        weights: List[float] = []
-        for i in ordered:
-            w = len(_normalize_for_match(output[i]["script_text"]).split())
-            weights.append(max(1.0, float(w)))
-        weight_sum = sum(weights)
-        if weight_sum <= 0:
-            weights = [1.0] * len(ordered)
-            weight_sum = float(len(ordered))
+        sub_segments.sort(key=lambda s: (float(s["start"]), float(s["end"])))
+        ordered = sorted(
+            row_indices,
+            key=lambda i: (
+                len(_normalize_for_match(output[i]["script_text"]).split()),
+                -float(output[i].get("score", 0.0)),
+                -float(output[i].get("similarity", 0.0)),
+            ),
+        )
 
-        cursor = chunk_start
-        for pos, i in enumerate(ordered):
-            if pos == len(ordered) - 1:
-                seg_start = cursor
-                seg_end = chunk_end
-            else:
-                share = total_duration * (weights[pos] / weight_sum)
-                seg_start = cursor
-                seg_end = min(chunk_end, seg_start + max(0.05, share))
-                cursor = seg_end
+        used_intervals: List[Tuple[float, float]] = []
+        for row_idx in ordered:
+            row = output[row_idx]
+            candidates = _subsegment_span_candidates(row["script_text"], sub_segments)
+            if not candidates:
+                continue
 
-            output[i]["start"] = seg_start
-            output[i]["end"] = seg_end
-            output[i]["shared_chunk_index"] = chunk_idx
-            output[i]["shared_chunk_group_size"] = len(ordered)
+            min_quality = max(0.38, float(row.get("similarity", 0.0)) - 0.18)
+            feasible = [c for c in candidates if c["similarity"] >= min_quality and c["token_coverage"] >= 0.25]
+            if not feasible:
+                feasible = candidates
+
+            chosen: Optional[Dict[str, Any]] = None
+            ordered_candidates = sorted(
+                feasible,
+                key=lambda c: (
+                    -sum(_interval_overlap(c["start"], c["end"], u0, u1) for u0, u1 in used_intervals),
+                    c["score"],
+                    c["similarity"],
+                ),
+                reverse=True,
+            )
+
+            for overlap_cap in (0.08, 0.20, 0.40):
+                for cand in ordered_candidates:
+                    overlap = sum(_interval_overlap(cand["start"], cand["end"], u0, u1) for u0, u1 in used_intervals)
+                    if overlap <= overlap_cap:
+                        chosen = cand
+                        break
+                if chosen is not None:
+                    break
+
+            if chosen is None:
+                chosen = ordered_candidates[0]
+
+            row["start"] = float(chosen["start"])
+            row["end"] = float(chosen["end"])
+            row["matched_text"] = chosen["text"]
+            row["loudness_dBFS"] = float(chosen["loudness_dBFS"])
+            row["similarity"] = float(chosen["similarity"])
+            row["token_coverage"] = float(chosen["token_coverage"])
+            row["score"] = float(chosen["score"])
+            row["shared_chunk_index"] = chunk_idx
+            row["shared_chunk_group_size"] = len(ordered)
+
+            used_intervals.append((row["start"], row["end"]))
+            used_intervals.sort()
 
     return output
 
@@ -1232,10 +1425,13 @@ def _split_shared_chunk_intervals(rows: List[Dict[str, Any]]) -> List[Dict[str, 
 def deterministic_filter_pipeline(
     reference_script: str,
     transcript_text: str,
-    chunk_gap_sec: float = 1.0,
+    chunk_gap_sec: float = 0.35,
+    session_file: str = "temp_uploads/session_segments.json",
 ) -> Dict[str, Any]:
     script_sentences = split_sentences(reference_script)
     raw_segments = parse_transcript_text(transcript_text)
+    #[MỚI] Phục hồi độ phân giải word-timestamps trước khi đưa vào chia chunk
+    raw_segments = restore_word_timestamps(raw_segments, session_file)
     processed_chunks = preprocess_transcript_segments(raw_segments, max_gap=chunk_gap_sec)
 
     if not script_sentences or not processed_chunks:
@@ -1297,9 +1493,10 @@ def deterministic_filter_pipeline(
         matched_rows=resolved_map,
     )
 
+    chunk_index_map = {idx: chunk for idx, chunk in enumerate(processed_chunks)}
     filtered_rows = list(resolved_map.values())
     filtered_rows.sort(key=lambda x: x["script_index"])
-    filtered_rows = _split_shared_chunk_intervals(filtered_rows)
+    filtered_rows = _rematch_shared_chunk_intervals(filtered_rows, chunk_index_map)
 
     for row in filtered_rows:
         row["loudness_dBFS"] = round(float(row["loudness_dBFS"]), 2)

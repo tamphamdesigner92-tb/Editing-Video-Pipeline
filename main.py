@@ -106,6 +106,11 @@ def api_transcribe(
             reference_script,
             transcribe_mode=transcribe_mode,
         )
+
+        # [MỚI] LƯU TOÀN BỘ DATA (GỒM WORD-TIMESTAMPS) VÀO LOCAL FILE
+        session_file = os.path.join(TEMP_DIR, "session_segments.json")
+        with open(session_file, "w", encoding="utf-8") as f:
+            json.dump(segments, f, ensure_ascii=False)
         
         set_status("Hoàn tất bóc băng! Đang chuẩn bị dữ liệu trả về...")
         raw_text = format_segments_to_text(segments)
