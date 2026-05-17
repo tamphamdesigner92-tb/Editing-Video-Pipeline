@@ -778,14 +778,15 @@ def _similarity(a: str, b: str) -> float:
 
     shorter_is_script = len(tokens_a) <= len(tokens_b)
     if shorter_is_script:
-        # Script ngắn hơn chunk: ưu tiên partial + recall để bắt "câu nằm trong chunk".
+        # CẢI TIẾN: Tăng Seq Score để AI không quá phụ thuộc vào Partial Match (tránh cắt hụt câu)
         return (
-            0.20 * seq_score
-            + 0.45 * partial_score
-            + 0.35 * max(token_recall, token_score)
+            0.35 * seq_score
+            + 0.35 * partial_score
+            + 0.30 * max(token_recall, token_score)
         )
 
-    return 0.45 * seq_score + 0.25 * partial_score + 0.30 * token_score
+    # CẢI TIẾN: Buộc AI phải đánh giá tính toàn vẹn của cả chuỗi cao hơn
+    return 0.50 * seq_score + 0.20 * partial_score + 0.30 * token_score
 
 
 def _is_retake_like_pair(text_a: str, text_b: str, threshold: float = 0.82) -> bool:
@@ -882,7 +883,21 @@ def apply_last_best_take(
         candidates: List[Tuple[int, float]] = []
         cutoff = max(match_threshold - 0.07, 0.63)
         for k in range(left_bound, right_bound + 1):
-            score = _similarity(script_sentences[script_idx], chunks[k]["text"])
+            chunk = chunks[k]
+            sub_segments = chunk.get("sub_segments", [])
+            
+            # ---- FIX: Dùng dao mổ (sub_segments) để soi vào bên trong chunk khi tìm Take cuối ----
+            if not sub_segments:
+                score = _similarity(script_sentences[script_idx], chunk["text"])
+            else:
+                spans = _subsegment_span_candidates(script_sentences[script_idx], sub_segments)
+                if spans:
+                    # Chỉ lấy điểm của đoạn cắt tốt nhất ẩn bên trong chunk
+                    score = spans[0]["score"]
+                else:
+                    score = _similarity(script_sentences[script_idx], chunk["text"])
+            # --------------------------------------------------------------------------------------
+            
             if score >= cutoff:
                 candidates.append((k, score))
 
@@ -908,9 +923,8 @@ def apply_last_best_take(
 
         # FIX: Luôn target vào cụm cuối cùng (Take cuối)
         target_cluster = clusters[-1]
-
         cluster_best = max(score for _, score in target_cluster)
-        acceptable = [c for c in target_cluster if c[1] >= cluster_best - 0.10]
+        acceptable = [c for c in target_cluster if c[1] >= cluster_best - 0.05]
         chosen_idx, chosen_score = acceptable[-1] if acceptable else target_cluster[-1]
 
         refined.append((script_idx, chosen_idx, chosen_score))
@@ -1045,10 +1059,12 @@ def _loudness_norm(loudness_dbfs: float) -> float:
 
 
 def _final_match_score(similarity: float, token_coverage: float, loudness_dbfs: float) -> float:
+    # CẢI TIẾN: Tăng mạnh quyền lực của Token Coverage (Từ 13% lên 35%). 
+    # AI sẽ "sợ" việc bỏ sót từ vựng vì sẽ bị rớt điểm rất nặng.
     return (
-        0.72 * similarity
-        + 0.15 * _loudness_norm(loudness_dbfs)
-        + 0.13 * token_coverage
+        0.55 * similarity
+        + 0.35 * token_coverage
+        + 0.10 * _loudness_norm(loudness_dbfs)
     )
 
 
@@ -1240,9 +1256,31 @@ def _expand_n_to_one_matches(
 
         for chunk_idx in all_chunk_indices:
             chunk = chunks[chunk_idx]
-            candidate = _build_match_row(script_idx, chunk_idx, sentence, chunk)
-            
-            # FIX: Hạ nhẹ tiêu chuẩn để dễ dàng vớt được các đoạn AI nghe hơi lộn xộn
+            sub_segments = chunk.get("sub_segments", [])
+               
+            # ---- FIX: Dùng dao mổ (sub_segments) để chấm điểm vớt thay vì cân cả khối chunk to ----
+            if not sub_segments:
+                # Fallback nếu không có sub_segments
+                candidate = _build_match_row(script_idx, chunk_idx, sentence, chunk)
+            else:
+                spans = _subsegment_span_candidates(sentence, sub_segments)
+                if not spans:
+                    continue
+                best_span = spans[0] # Lấy khoảng thời gian (span) có điểm cao nhất bên trong chunk
+                candidate = {
+                    "script_index": script_idx,
+                    "chunk_index": chunk_idx,
+                    "start": best_span["start"],
+                    "end": best_span["end"],
+                    "script_text": sentence,
+                    "matched_text": best_span["text"],
+                    "loudness_dBFS": best_span["loudness_dBFS"],
+                    "similarity": best_span["similarity"],
+                    "token_coverage": best_span["token_coverage"],                        "score": best_span["score"],
+                }
+            # ---------------------------------------------------------------------------------------
+
+            # Hạ nhẹ tiêu chuẩn để dễ dàng vớt được các đoạn AI nghe hơi lộn xộn
             if (
                 candidate["similarity"] < 0.28
                 or candidate["token_coverage"] < 0.35
@@ -1250,16 +1288,13 @@ def _expand_n_to_one_matches(
             ):
                 continue
 
-            if best_row is None or (
-                candidate["score"],
-                candidate["similarity"],
-                candidate["token_coverage"],
-            ) > (
-                best_row["score"],
-                best_row["similarity"],
-                best_row["token_coverage"],
-            ):
+            if best_row is None:
                 best_row = candidate
+            else:
+                # Logic ưu tiên Take cuối vẫn giữ nguyên
+                score_diff = candidate["score"] - best_row["score"]
+                if score_diff > 0.03 or (abs(score_diff) <= 0.03 and candidate["chunk_index"] > best_row["chunk_index"]):
+                    best_row = candidate
 
         if best_row is not None:
             matched_rows[script_idx] = best_row
@@ -1283,6 +1318,7 @@ def _subsegment_span_candidates(
     if n == 0:
         return candidates
 
+    # 1. Thuật toán quét cửa sổ trượt (Sliding Window)
     for i in range(n):
         span_text_parts: List[str] = []
         loud_sum = 0.0
@@ -1313,17 +1349,84 @@ def _subsegment_span_candidates(
             similarity = _similarity(script_text, span_text)
             token_coverage = _token_coverage(script_text, span_text)
             score = _final_match_score(similarity, token_coverage, loudness)
-            candidates.append(
-                {
-                    "start": span_start,
-                    "end": span_end,
-                    "text": span_text,
-                    "loudness_dBFS": loudness,
-                    "similarity": similarity,
-                    "token_coverage": token_coverage,
-                    "score": score,
-                }
-            )
+            
+            # CẢI TIẾN: Thưởng điểm nếu lấy đủ 100% từ vựng cốt lõi -> Chống lẹm đầu lẹm đuôi
+            if token_coverage >= 0.95:
+                score += 0.04
+
+            candidates.append({
+                "start": span_start,
+                "end": span_end,
+                "text": span_text,
+                "loudness_dBFS": loudness,
+                "similarity": similarity,
+                "token_coverage": token_coverage,
+                "score": score,
+            })
+
+    # 2. Thuật toán Căn chỉnh Ký tự (NLP Alignment)
+    chunk_text = ""
+    char_to_sub = []
+    for i, sub in enumerate(sub_segments):
+        word = str(sub.get("text", "")).strip() + " "
+        chunk_text += word
+        char_to_sub.extend([i] * len(word))
+
+    def clean_len_preserve(t: str) -> str:
+        t = t.lower()
+        t = "".join(c if c.isalnum() else " " for c in t)
+        return _strip_diacritics(t)
+
+    script_clean = clean_len_preserve(script_text)
+    chunk_clean = clean_len_preserve(chunk_text)
+
+    matcher = SequenceMatcher(None, script_clean, chunk_clean)
+    blocks = matcher.get_matching_blocks()
+    
+    valid_blocks = [b for b in blocks if b.size >= 3]
+    if not valid_blocks:
+        valid_blocks = [b for b in blocks if b.size >= 2]
+        
+    if valid_blocks:
+        start_char = valid_blocks[0].b
+        end_char = valid_blocks[-1].b + valid_blocks[-1].size - 1
+        
+        start_char = max(0, min(start_char, len(char_to_sub) - 1))
+        end_char = max(0, min(end_char, len(char_to_sub) - 1))
+
+        start_idx = char_to_sub[start_char]
+        end_idx = char_to_sub[end_char]
+
+        if start_idx <= end_idx:
+            span_subs = sub_segments[start_idx:end_idx + 1]
+            span_start = float(span_subs[0]["start"])
+            span_end = float(span_subs[-1]["end"])
+            span_text = " ".join(str(s.get("text", "")).strip() for s in span_subs if str(s.get("text", "")).strip())
+
+            loud_sum = sum(float(s.get("loudness_dBFS", 0.0)) * max(0.0, float(s["end"]) - float(s["start"])) for s in span_subs)
+            dur_sum = sum(max(0.0, float(s["end"]) - float(s["start"])) for s in span_subs)
+            loudness = (loud_sum / dur_sum) if dur_sum > 0 else float(span_subs[0].get("loudness_dBFS", 0.0))
+
+            similarity = _similarity(script_text, span_text)
+            token_coverage = _token_coverage(script_text, span_text)
+            score = _final_match_score(similarity, token_coverage, loudness)
+            
+            # CẢI TIẾN: NLP Alignment thường chốt biên rất chuẩn. Nếu nó tìm được cụm bao trọn vẹn từ
+            # Thưởng siêu đậm để ép AI chọn ứng viên này làm Winner thay vì ứng viên của Sliding Window.
+            if token_coverage >= 0.95:
+                score += 0.08 
+            else:
+                score += 0.03
+
+            candidates.append({
+                "start": span_start,
+                "end": span_end,
+                "text": span_text,
+                "loudness_dBFS": loudness,
+                "similarity": similarity,
+                "token_coverage": token_coverage,
+                "score": score,
+            })
 
     candidates.sort(
         key=lambda c: (
@@ -1415,11 +1518,11 @@ def _rematch_shared_chunk_intervals(
             chunk_end = float(chunk["end"])
 
             # Nếu thời gian tìm được nằm sát đầu chunk (dung sai 0.8s) -> Bắt dính luôn mốc đầu chunk
-            if chosen_start - chunk_start <= 0.8:
+            if chosen_start - chunk_start <= 1.0:
                 chosen_start = chunk_start
             
             # Nếu thời gian tìm được nằm sát cuối chunk (dung sai 0.6s) -> Bắt dính luôn mốc cuối chunk
-            if chunk_end - chosen_end <= 0.6:
+            if chunk_end - chosen_end <= 1.0:
                 chosen_end = chunk_end
 
             row["start"] = chosen_start
@@ -1520,15 +1623,20 @@ def deterministic_filter_pipeline(
         pad_start = max(0.0, filtered_rows[i]["start"] - 0.08)
         pad_end = filtered_rows[i]["end"] + 0.15
         
-        # Chống đè chéo (overlap) với câu trước đó nếu người nói nói liên tục quá sát nhau
+        # Chống đè chéo (overlap) với câu trước đó
         if i > 0:
             prev_end = filtered_rows[i-1]["end"]
-            if filtered_rows[i]["start"] - prev_end < 0.2:
+            gap = filtered_rows[i]["start"] - prev_end
+            
+            # CHỈ chống đè chéo nếu 2 câu nằm nối tiếp nhau (gap từ -0.5s đến 0.2s)
+            # Nếu gap < -0.5s (nghĩa là ứng dụng chọn take cũ, nhảy ngược về quá khứ), KHÔNG ép start.
+            if -0.5 < gap < 0.2:
                 pad_start = max(prev_end, pad_start)
                 
         filtered_rows[i]["start"] = pad_start
         filtered_rows[i]["end"] = pad_end
-    
+    # ----------------------------------------------------------
+
     for row in filtered_rows:
         row["loudness_dBFS"] = round(float(row["loudness_dBFS"]), 2)
         row["similarity"] = round(float(row["similarity"]), 4)
