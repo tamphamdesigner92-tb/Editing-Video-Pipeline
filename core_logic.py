@@ -624,11 +624,10 @@ def parse_transcript_text(transcript_text: str) -> List[Dict[str, Any]]:
 
 def _normalize_for_match(text: str) -> str:
     lowered = text.lower()
+    # Chỉ loại bỏ dấu câu, giữ nguyên toàn bộ chữ (bao gồm cả "nhé", "mà")
     lowered = re.sub(r"[^\w\s]", " ", lowered)
     lowered = re.sub(r"\s+", " ", lowered).strip()
-    tokens = [tok for tok in lowered.split() if tok not in FILLER_WORDS]
-    return " ".join(tokens)
-
+    return lowered
 
 def _strip_diacritics(text: str) -> str:
     normalized = unicodedata.normalize("NFD", text)
@@ -1231,20 +1230,23 @@ def _expand_n_to_one_matches(
     if not matched_rows:
         return matched_rows, 0
 
-    used_chunk_indices = {row["chunk_index"] for row in matched_rows.values()}
+    # FIX: Quét TẤT CẢ các đoạn audio, không chỉ các đoạn đã dùng
+    all_chunk_indices = range(len(chunks))
     unmatched_script_indices = [i for i in range(len(script_sentences)) if i not in matched_rows]
 
     for script_idx in unmatched_script_indices:
         sentence = script_sentences[script_idx]
         best_row: Optional[Dict[str, Any]] = None
 
-        for chunk_idx in used_chunk_indices:
+        for chunk_idx in all_chunk_indices:
             chunk = chunks[chunk_idx]
             candidate = _build_match_row(script_idx, chunk_idx, sentence, chunk)
+            
+            # FIX: Hạ nhẹ tiêu chuẩn để dễ dàng vớt được các đoạn AI nghe hơi lộn xộn
             if (
-                candidate["similarity"] < 0.35
-                or candidate["token_coverage"] < 0.50
-                or candidate["score"] < 0.43
+                candidate["similarity"] < 0.28
+                or candidate["token_coverage"] < 0.35
+                or candidate["score"] < 0.38
             ):
                 continue
 
@@ -1353,7 +1355,7 @@ def _rematch_shared_chunk_intervals(
 
     output = [dict(row) for row in rows]
     for chunk_idx, row_indices in grouped.items():
-        if chunk_idx < 0 or len(row_indices) <= 1:
+        if chunk_idx < 0 or not row_indices:
             continue
 
         chunk = chunks_by_index.get(chunk_idx, {})
@@ -1406,8 +1408,22 @@ def _rematch_shared_chunk_intervals(
             if chosen is None:
                 chosen = ordered_candidates[0]
 
-            row["start"] = float(chosen["start"])
-            row["end"] = float(chosen["end"])
+            # ---- FIX: SNAP ĐẦU MÚT (Nam châm hút boundary) ----
+            chosen_start = float(chosen["start"])
+            chosen_end = float(chosen["end"])
+            chunk_start = float(chunk["start"])
+            chunk_end = float(chunk["end"])
+
+            # Nếu thời gian tìm được nằm sát đầu chunk (dung sai 0.8s) -> Bắt dính luôn mốc đầu chunk
+            if chosen_start - chunk_start <= 0.8:
+                chosen_start = chunk_start
+            
+            # Nếu thời gian tìm được nằm sát cuối chunk (dung sai 0.6s) -> Bắt dính luôn mốc cuối chunk
+            if chunk_end - chosen_end <= 0.6:
+                chosen_end = chunk_end
+
+            row["start"] = chosen_start
+            row["end"] = chosen_end
             row["matched_text"] = chosen["text"]
             row["loudness_dBFS"] = float(chosen["loudness_dBFS"])
             row["similarity"] = float(chosen["similarity"])
@@ -1498,6 +1514,21 @@ def deterministic_filter_pipeline(
     filtered_rows.sort(key=lambda x: x["script_index"])
     filtered_rows = _rematch_shared_chunk_intervals(filtered_rows, chunk_index_map)
 
+    # ---- FIX: PADDING TIME (BÙ HAO ÂM THANH CHỐNG CỤT LỦN) ----
+    for i in range(len(filtered_rows)):
+        # Bù 0.08s ở đầu để bắt trọn hơi thở, bù 0.15s ở cuối để giữ độ vang
+        pad_start = max(0.0, filtered_rows[i]["start"] - 0.08)
+        pad_end = filtered_rows[i]["end"] + 0.15
+        
+        # Chống đè chéo (overlap) với câu trước đó nếu người nói nói liên tục quá sát nhau
+        if i > 0:
+            prev_end = filtered_rows[i-1]["end"]
+            if filtered_rows[i]["start"] - prev_end < 0.2:
+                pad_start = max(prev_end, pad_start)
+                
+        filtered_rows[i]["start"] = pad_start
+        filtered_rows[i]["end"] = pad_end
+    
     for row in filtered_rows:
         row["loudness_dBFS"] = round(float(row["loudness_dBFS"]), 2)
         row["similarity"] = round(float(row["similarity"]), 4)
