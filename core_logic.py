@@ -5,9 +5,13 @@ import subprocess
 import unicodedata
 import warnings
 import json
+from concurrent.futures import ThreadPoolExecutor
 from difflib import SequenceMatcher
+from functools import lru_cache
+from time import perf_counter
 from typing import Any, Dict, List, Optional, Tuple
 
+from rapidfuzz import fuzz
 import torch
 import whisper
 from pydub import AudioSegment
@@ -91,6 +95,25 @@ FILLER_WORDS = {
     "mà",
     "ơi",
 }
+
+_NORMALIZE_NON_WORD_RE = re.compile(r"[^\w\s]")
+_NORMALIZE_SPACE_RE = re.compile(r"\s+")
+_NUMBER_PUNCT_RE = re.compile(r"(\d)[.,](\d)")
+_NUMBER_RE = re.compile(r"\d+")
+_NUMBER_WORD_PATTERNS: Tuple[Tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\bmười một\b"), "11"),
+    (re.compile(r"\bmười hai\b"), "12"),
+    (re.compile(r"\bmột\b"), "1"),
+    (re.compile(r"\bhai\b"), "2"),
+    (re.compile(r"\bba\b"), "3"),
+    (re.compile(r"\bbốn\b"), "4"),
+    (re.compile(r"\bnăm\b"), "5"),
+    (re.compile(r"\bsáu\b"), "6"),
+    (re.compile(r"\bbảy\b"), "7"),
+    (re.compile(r"\btám\b"), "8"),
+    (re.compile(r"\bchín\b"), "9"),
+    (re.compile(r"\bmười\b"), "10"),
+)
 
 def restore_word_timestamps(parsed_segments: List[Dict[str, Any]], session_file: str) -> List[Dict[str, Any]]:
     """Đọc file local để lấy lại word-timestamps và map vào các segment từ UI"""
@@ -624,18 +647,48 @@ def parse_transcript_text(transcript_text: str) -> List[Dict[str, Any]]:
 
 def _normalize_for_match(text: str) -> str:
     lowered = text.lower()
-    # Chỉ loại bỏ dấu câu, giữ nguyên toàn bộ chữ (bao gồm cả "nhé", "mà")
-    lowered = re.sub(r"[^\w\s]", " ", lowered)
-    lowered = re.sub(r"\s+", " ", lowered).strip()
+    lowered = _NORMALIZE_NON_WORD_RE.sub(" ", lowered)
+    lowered = _NORMALIZE_SPACE_RE.sub(" ", lowered).strip()
     return lowered
+
+
+@lru_cache(maxsize=8192)
+def _normalize_for_match_cached(text: str) -> str:
+    return _normalize_for_match(text)
+
 
 def _strip_diacritics(text: str) -> str:
     normalized = unicodedata.normalize("NFD", text)
     return "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
 
 
+@lru_cache(maxsize=8192)
+def _strip_diacritics_cached(text: str) -> str:
+    return _strip_diacritics(text)
+
+
+@lru_cache(maxsize=32768)
+def _match_features_cached(text: str) -> Tuple[str, str, Tuple[str, ...], frozenset[str]]:
+    normalized = _normalize_for_match_cached(text)
+    if not normalized:
+        return "", "", tuple(), frozenset()
+
+    ascii_text = _strip_diacritics_cached(normalized)
+    tokens = tuple(ascii_text.split())
+    return normalized, ascii_text, tokens, frozenset(tokens)
+
+
+def _quick_token_overlap(tokens_a: frozenset[str], tokens_b: frozenset[str]) -> float:
+    if not tokens_a or not tokens_b:
+        return 0.0
+    union = tokens_a | tokens_b
+    if not union:
+        return 0.0
+    return len(tokens_a & tokens_b) / len(union)
+
+
 def _is_director_cue(text: str) -> bool:
-    normalized = re.sub(r"\s+", " ", text.lower()).strip()
+    normalized = _NORMALIZE_SPACE_RE.sub(" ", text.lower()).strip()
     return any(keyword in normalized for keyword in DIRECTOR_CUE_KEYWORDS)
 
 
@@ -728,125 +781,81 @@ def preprocess_transcript_segments(
     return merged
 
 
-def _partial_ratio(text_a: str, text_b: str) -> float:
-    if not text_a or not text_b:
-        return 0.0
+@lru_cache(maxsize=8192)
+def _extract_nums_cached(text: str) -> Tuple[str, ...]:
+    parsed = text.lower()
+    parsed = _NUMBER_PUNCT_RE.sub(r"\1\2", parsed)
+    for pattern, replacement in _NUMBER_WORD_PATTERNS:
+        parsed = pattern.sub(replacement, parsed)
+    return tuple(_NUMBER_RE.findall(parsed))
 
-    if len(text_a) <= len(text_b):
-        shorter, longer = text_a, text_b
-    else:
-        shorter, longer = text_b, text_a
-
-    if shorter == longer:
-        return 1.0
-    if shorter in longer:
-        return 1.0
-
-    matcher = SequenceMatcher(None, shorter, longer)
-    blocks = matcher.get_matching_blocks()
-    best = 0.0
-    short_len = len(shorter)
-    long_len = len(longer)
-
-    for block in blocks:
-        start = max(0, block.b - block.a)
-        end = min(long_len, start + short_len)
-        start = max(0, end - short_len)
-        window = longer[start:end]
-        if not window:
-            continue
-        score = SequenceMatcher(None, shorter, window).ratio()
-        if score > best:
-            best = score
-
-    if best == 0.0:
-        best = SequenceMatcher(None, shorter, longer).ratio()
-    return best
 
 def _check_number_consistency(script_text: str, raw_text: str) -> bool:
     """
-    Luật thép Nâng cấp: Các con số trong kịch bản phải xuất hiện 
+    Luật thép Nâng cấp: Các con số trong kịch bản phải xuất hiện
     ĐÚNG THỨ TỰ và LIÊN TIẾP NHAU trong audio thực tế.
     """
-    def extract_nums(text: str) -> list:  # Sửa từ set sang list để giữ đúng thứ tự
-        t = text.lower()
-        # Xóa dấu phẩy và chấm giữa các con số (VD: 1.000 -> 1000, 1,7 -> 17)
-        t = re.sub(r'(\d)[.,](\d)', r'\1\2', t)
-        
-        # Chuyển đổi các chữ số cơ bản thành số
-        num_map = {
-            r'\bmười một\b': '11', r'\bmười hai\b': '12',
-            r'\bmột\b': '1', r'\bhai\b': '2', r'\bba\b': '3', r'\bbốn\b': '4',
-            r'\bnăm\b': '5', r'\bsáu\b': '6', r'\bbảy\b': '7', r'\btám\b': '8',
-            r'\bchín\b': '9', r'\bmười\b': '10'
-        }
-        for pat, repl in num_map.items():
-            t = re.sub(pat, repl, t)
-            
-        return re.findall(r'\d+', t)
-
-    script_nums = extract_nums(script_text)
+    script_nums = _extract_nums_cached(script_text)
     if not script_nums:
-        return True # Không có số -> Pass
-        
-    raw_nums = extract_nums(raw_text)
-    
-    # ---- FIX MỚI: KIỂM TRA CHUỖI LIÊN TIẾP (Sub-list Matching) ----
-    n = len(script_nums)
-    # Lướt một "cửa sổ" qua danh sách số thực tế để tìm chuỗi khớp hoàn toàn
-    for i in range(len(raw_nums) - n + 1):
-        if raw_nums[i:i+n] == script_nums:
-            return True
-            
-    return False
-    # ---------------------------------------------------------------
+        return True
 
-def _similarity(a: str, b: str) -> float:
-    # --- ÁP DỤNG LUẬT THÉP ---
-    if not _check_number_consistency(a, b):
+    raw_nums = _extract_nums_cached(raw_text)
+
+    n = len(script_nums)
+    for i in range(len(raw_nums) - n + 1):
+        if raw_nums[i:i + n] == script_nums:
+            return True
+
+    return False
+
+def _similarity_from_features(
+    script_text: str,
+    raw_text: str,
+    script_features: Optional[Tuple[str, str, Tuple[str, ...], frozenset[str]]] = None,
+    raw_features: Optional[Tuple[str, str, Tuple[str, ...], frozenset[str]]] = None,
+) -> float:
+    if not _check_number_consistency(script_text, raw_text):
         return 0.0
 
-    norm_a = _normalize_for_match(a)
-    norm_b = _normalize_for_match(b)
+    if script_features is None:
+        script_features = _match_features_cached(script_text)
+    if raw_features is None:
+        raw_features = _match_features_cached(raw_text)
+
+    norm_a, norm_a_ascii, tokens_a, set_a = script_features
+    norm_b, norm_b_ascii, tokens_b, set_b = raw_features
     if not norm_a or not norm_b:
         return 0.0
 
-    norm_a_ascii = _strip_diacritics(norm_a)
-    norm_b_ascii = _strip_diacritics(norm_b)
+    if _quick_token_overlap(set_a, set_b) == 0.0:
+        return 0.0
 
     seq_score = max(
-        SequenceMatcher(None, norm_a, norm_b).ratio(),
-        SequenceMatcher(None, norm_a_ascii, norm_b_ascii).ratio(),
+        fuzz.ratio(norm_a, norm_b) / 100.0,
+        fuzz.ratio(norm_a_ascii, norm_b_ascii) / 100.0,
     )
     partial_score = max(
-        _partial_ratio(norm_a, norm_b),
-        _partial_ratio(norm_a_ascii, norm_b_ascii),
+        fuzz.partial_ratio(norm_a, norm_b) / 100.0,
+        fuzz.partial_ratio(norm_a_ascii, norm_b_ascii) / 100.0,
     )
 
-    tokens_a = norm_a_ascii.split()
-    tokens_b = norm_b_ascii.split()
-    set_a = set(tokens_a)
-    set_b = set(tokens_b)
-
-    if not set_a or not set_b:
-        token_score = 0.0
-        token_recall = 0.0
-    else:
-        overlap = len(set_a & set_b)
-        token_score = (2 * overlap) / (len(set_a) + len(set_b))
-        token_recall = overlap / len(set_a)
+    overlap = len(set_a & set_b)
+    token_score = (2 * overlap) / (len(set_a) + len(set_b))
+    token_recall = overlap / len(set_a)
 
     shorter_is_script = len(tokens_a) <= len(tokens_b)
     if shorter_is_script:
-        # CẢI TIẾN: Tăng Seq Score để AI không quá phụ thuộc vào Partial Match (tránh cắt hụt câu)
         return (
             0.35 * seq_score
             + 0.35 * partial_score
             + 0.30 * max(token_recall, token_score)
         )
 
-    # CẢI TIẾN: Buộc AI phải đánh giá tính toàn vẹn của cả chuỗi cao hơn
     return 0.50 * seq_score + 0.20 * partial_score + 0.30 * token_score
+
+
+def _similarity(a: str, b: str) -> float:
+    return _similarity_from_features(a, b)
 
 
 def _is_retake_like_pair(text_a: str, text_b: str, threshold: float = 0.82) -> bool:
@@ -867,10 +876,22 @@ def align_sequence_needleman_wunsch(
     if m == 0 or n == 0:
         return []
 
+    script_features = [_match_features_cached(sentence) for sentence in script_sentences]
+    chunk_texts = [chunk["text"] for chunk in transcript_chunks]
+    chunk_features = [_match_features_cached(text) for text in chunk_texts]
+
     scores = [[0.0] * n for _ in range(m)]
     for i in range(m):
+        sentence = script_sentences[i]
+        sentence_features = script_features[i]
         for j in range(n):
-            scores[i][j] = _similarity(script_sentences[i], transcript_chunks[j]["text"])
+            chunk_text = chunk_texts[j]
+            scores[i][j] = _similarity_from_features(
+                sentence,
+                chunk_text,
+                script_features=sentence_features,
+                raw_features=chunk_features[j],
+            )
 
     dp = [[0.0] * (n + 1) for _ in range(m + 1)]
     trace = [[""] * (n + 1) for _ in range(m + 1)]
@@ -1107,12 +1128,10 @@ def _clamp(value: float, lower: float, upper: float) -> float:
 
 
 def _token_coverage(script_text: str, transcript_text: str) -> float:
-    # --- ÁP DỤNG LUẬT THÉP ---
     if not _check_number_consistency(script_text, transcript_text):
         return 0.0
-    # -------------------------
-    script_tokens = set(_strip_diacritics(_normalize_for_match(script_text)).split())
-    transcript_tokens = set(_strip_diacritics(_normalize_for_match(transcript_text)).split())
+    _, _, _, script_tokens = _match_features_cached(script_text)
+    _, _, _, transcript_tokens = _match_features_cached(transcript_text)
     if not script_tokens:
         return 0.0
     return len(script_tokens & transcript_tokens) / len(script_tokens)
@@ -1302,6 +1321,58 @@ def _build_match_row(
     }
 
 
+def _process_one_unmatched(
+    script_idx: int,
+    script_sentences: List[str],
+    chunks: List[Dict[str, Any]],
+) -> Tuple[int, Optional[Dict[str, Any]]]:
+    sentence = script_sentences[script_idx]
+    best_row: Optional[Dict[str, Any]] = None
+
+    for chunk_idx, chunk in enumerate(chunks):
+        sub_segments = chunk.get("sub_segments", [])
+
+        if not sub_segments:
+            candidate = _build_match_row(script_idx, chunk_idx, sentence, chunk)
+        else:
+            spans = _subsegment_span_candidates(sentence, sub_segments)
+            if not spans:
+                continue
+            best_span = spans[0]
+            candidate = {
+                "script_index": script_idx,
+                "chunk_index": chunk_idx,
+                "start": best_span["start"],
+                "end": best_span["end"],
+                "script_text": sentence,
+                "matched_text": best_span["text"],
+                "loudness_dBFS": best_span["loudness_dBFS"],
+                "similarity": best_span["similarity"],
+                "token_coverage": best_span["token_coverage"],
+                "score": best_span["score"],
+            }
+
+        if (
+            candidate["similarity"] < 0.28
+            or candidate["token_coverage"] < 0.35
+            or candidate["score"] < 0.38
+        ):
+            continue
+
+        if best_row is None:
+            best_row = candidate
+            continue
+
+        score_diff = candidate["score"] - best_row["score"]
+        if score_diff > 0.03 or (
+            abs(score_diff) <= 0.03
+            and candidate["chunk_index"] > best_row["chunk_index"]
+        ):
+            best_row = candidate
+
+    return script_idx, best_row
+
+
 def _expand_n_to_one_matches(
     script_sentences: List[str],
     chunks: List[Dict[str, Any]],
@@ -1310,58 +1381,25 @@ def _expand_n_to_one_matches(
     if not matched_rows:
         return matched_rows, 0
 
-    # FIX: Quét TẤT CẢ các đoạn audio, không chỉ các đoạn đã dùng
-    all_chunk_indices = range(len(chunks))
     unmatched_script_indices = [i for i in range(len(script_sentences)) if i not in matched_rows]
 
-    for script_idx in unmatched_script_indices:
-        sentence = script_sentences[script_idx]
-        best_row: Optional[Dict[str, Any]] = None
+    if unmatched_script_indices:
+        max_workers = min(4, os.cpu_count() or 1)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(
+                    _process_one_unmatched,
+                    script_idx,
+                    script_sentences,
+                    chunks,
+                )
+                for script_idx in unmatched_script_indices
+            ]
+            matched_candidates = [future.result() for future in futures]
 
-        for chunk_idx in all_chunk_indices:
-            chunk = chunks[chunk_idx]
-            sub_segments = chunk.get("sub_segments", [])
-               
-            # ---- FIX: Dùng dao mổ (sub_segments) để chấm điểm vớt thay vì cân cả khối chunk to ----
-            if not sub_segments:
-                # Fallback nếu không có sub_segments
-                candidate = _build_match_row(script_idx, chunk_idx, sentence, chunk)
-            else:
-                spans = _subsegment_span_candidates(sentence, sub_segments)
-                if not spans:
-                    continue
-                best_span = spans[0] # Lấy khoảng thời gian (span) có điểm cao nhất bên trong chunk
-                candidate = {
-                    "script_index": script_idx,
-                    "chunk_index": chunk_idx,
-                    "start": best_span["start"],
-                    "end": best_span["end"],
-                    "script_text": sentence,
-                    "matched_text": best_span["text"],
-                    "loudness_dBFS": best_span["loudness_dBFS"],
-                    "similarity": best_span["similarity"],
-                    "token_coverage": best_span["token_coverage"],                        "score": best_span["score"],
-                }
-            # ---------------------------------------------------------------------------------------
-
-            # Hạ nhẹ tiêu chuẩn để dễ dàng vớt được các đoạn AI nghe hơi lộn xộn
-            if (
-                candidate["similarity"] < 0.28
-                or candidate["token_coverage"] < 0.35
-                or candidate["score"] < 0.38
-            ):
-                continue
-
-            if best_row is None:
-                best_row = candidate
-            else:
-                # Logic ưu tiên Take cuối vẫn giữ nguyên
-                score_diff = candidate["score"] - best_row["score"]
-                if score_diff > 0.03 or (abs(score_diff) <= 0.03 and candidate["chunk_index"] > best_row["chunk_index"]):
-                    best_row = candidate
-
-        if best_row is not None:
-            matched_rows[script_idx] = best_row
+        for script_idx, best_row in sorted(matched_candidates, key=lambda item: item[0]):
+            if best_row is not None:
+                matched_rows[script_idx] = best_row
 
     shared_groups = {}
     for row in matched_rows.values():
@@ -1439,7 +1477,7 @@ def _subsegment_span_candidates(
     def clean_len_preserve(t: str) -> str:
         t = t.lower()
         t = "".join(c if c.isalnum() else " " for c in t)
-        return _strip_diacritics(t)
+        return _strip_diacritics_cached(t)
 
     script_clean = clean_len_preserve(script_text)
     chunk_clean = clean_len_preserve(chunk_text)
@@ -1534,7 +1572,7 @@ def _rematch_shared_chunk_intervals(
         ordered = sorted(
             row_indices,
             key=lambda i: (
-                len(_normalize_for_match(output[i]["script_text"]).split()),
+                len(_normalize_for_match_cached(output[i]["script_text"]).split()),
                 -float(output[i].get("score", 0.0)),
                 -float(output[i].get("similarity", 0.0)),
             ),
@@ -1611,13 +1649,22 @@ def deterministic_filter_pipeline(
     chunk_gap_sec: float = 0.35,
     session_file: str = "temp_uploads/session_segments.json",
 ) -> Dict[str, Any]:
+    pipeline_start = perf_counter()
+    stage_timings: Dict[str, float] = {}
+
+    stage_start = perf_counter()
     script_sentences = split_sentences(reference_script)
     raw_segments = parse_transcript_text(transcript_text)
-    #[MỚI] Phục hồi độ phân giải word-timestamps trước khi đưa vào chia chunk
+    # [MỚI] Phục hồi độ phân giải word-timestamps trước khi đưa vào chia chunk
     raw_segments = restore_word_timestamps(raw_segments, session_file)
     processed_chunks = preprocess_transcript_segments(raw_segments, max_gap=chunk_gap_sec)
+    stage_timings["prepare_inputs"] = perf_counter() - stage_start
+
+    def _rounded_stage_timings() -> Dict[str, float]:
+        return {name: round(seconds, 4) for name, seconds in stage_timings.items()}
 
     if not script_sentences or not processed_chunks:
+        stage_timings["total_pipeline"] = perf_counter() - pipeline_start
         return {
             "filtered_script": "",
             "filtered_rows": [],
@@ -1641,9 +1688,11 @@ def deterministic_filter_pipeline(
                 "nw_match_count": 0,
                 "last_best_take_count": 0,
                 "n_to_one_shared_chunks": 0,
+                "timings_sec": _rounded_stage_timings(),
             },
         }
 
+    stage_start = perf_counter()
     nw_matches = align_sequence_needleman_wunsch(
         script_sentences=script_sentences,
         transcript_chunks=processed_chunks,
@@ -1653,14 +1702,19 @@ def deterministic_filter_pipeline(
         gap_chunk_penalty=-0.05,
         mismatch_penalty=-0.24,
     )
+    stage_timings["align_sequence_nw"] = perf_counter() - stage_start
+
+    stage_start = perf_counter()
     refined_matches = apply_last_best_take(
         script_sentences=script_sentences,
         chunks=processed_chunks,
         matches=nw_matches,
         match_threshold=0.42,
     )
+    stage_timings["apply_last_best_take"] = perf_counter() - stage_start
 
     resolved_map: Dict[int, Dict[str, Any]] = {}
+    stage_start = perf_counter()
     for script_idx, chunk_idx, _ in refined_matches:
         chunk = processed_chunks[chunk_idx]
         resolved_map[script_idx] = _build_match_row(
@@ -1669,19 +1723,25 @@ def deterministic_filter_pipeline(
             script_sentence=script_sentences[script_idx],
             chunk=chunk,
         )
+    stage_timings["build_initial_rows"] = perf_counter() - stage_start
 
+    stage_start = perf_counter()
     resolved_map, n_to_one_shared_chunks = _expand_n_to_one_matches(
         script_sentences=script_sentences,
         chunks=processed_chunks,
         matched_rows=resolved_map,
     )
+    stage_timings["expand_n_to_one"] = perf_counter() - stage_start
 
+    stage_start = perf_counter()
     chunk_index_map = {idx: chunk for idx, chunk in enumerate(processed_chunks)}
     filtered_rows = list(resolved_map.values())
     filtered_rows.sort(key=lambda x: x["script_index"])
     filtered_rows = _rematch_shared_chunk_intervals(filtered_rows, chunk_index_map)
+    stage_timings["rematch_shared_intervals"] = perf_counter() - stage_start
 
     # ---- FIX: PADDING TIME (BÙ HAO ÂM THANH CHỐNG CỤT LỦN) ----
+    stage_start = perf_counter()
     for i in range(len(filtered_rows)):
         # Bù 0.08s ở đầu để bắt trọn hơi thở, bù 0.15s ở cuối để giữ độ vang
         pad_start = max(0.0, filtered_rows[i]["start"] - 0.08)
@@ -1727,6 +1787,8 @@ def deterministic_filter_pipeline(
         if i not in matched_script_indices
     ]
     low_loudness_selected_count = len([item for item in timeline_script_order if item["loudness_dBFS"] < -20.0])
+    stage_timings["finalize_output"] = perf_counter() - stage_start
+    stage_timings["total_pipeline"] = perf_counter() - pipeline_start
 
     return {
         "filtered_script": "\n".join(filtered_lines),
@@ -1748,6 +1810,7 @@ def deterministic_filter_pipeline(
             "nw_match_count": len(nw_matches),
             "last_best_take_count": len(refined_matches),
             "n_to_one_shared_chunks": n_to_one_shared_chunks,
+            "timings_sec": _rounded_stage_timings(),
         },
     }
 
