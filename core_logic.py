@@ -100,6 +100,12 @@ _NORMALIZE_NON_WORD_RE = re.compile(r"[^\w\s]")
 _NORMALIZE_SPACE_RE = re.compile(r"\s+")
 _NUMBER_PUNCT_RE = re.compile(r"(\d)[.,](\d)")
 _NUMBER_RE = re.compile(r"\d+")
+_ENUMERATED_NUMBER_PAIR_RE = re.compile(
+    r"\bso\s*(\d+)\s*(?:se\s*)?la\s*(\d+(?:[.,]\d+)?)"
+)
+_HOUR_RANGE_RE = re.compile(
+    r"(\d{1,2})\s*(?:h|gio)\b[^0-9]{0,40}?\bden\b[^0-9]{0,40}?(\d{1,2})\s*(?:h|gio)\b"
+)
 _NUMBER_WORD_PATTERNS: Tuple[Tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bmười một\b"), "11"),
     (re.compile(r"\bmười hai\b"), "12"),
@@ -790,16 +796,95 @@ def _extract_nums_cached(text: str) -> Tuple[str, ...]:
     return tuple(_NUMBER_RE.findall(parsed))
 
 
+@lru_cache(maxsize=8192)
+def _normalize_for_number_patterns(text: str) -> str:
+    lowered = text.lower()
+    lowered = _strip_diacritics_cached(lowered)
+    lowered = _NORMALIZE_SPACE_RE.sub(" ", lowered).strip()
+    return lowered
+
+
+def _canonical_number_token(raw_value: str) -> str:
+    compact = _NUMBER_PUNCT_RE.sub(r"\1\2", raw_value)
+    digits = _NUMBER_RE.findall(compact)
+    return "".join(digits)
+
+
+@lru_cache(maxsize=8192)
+def _extract_enumerated_number_pairs_cached(text: str) -> Tuple[Tuple[str, str], ...]:
+    normalized = _normalize_for_number_patterns(text)
+    pairs: Dict[str, str] = {}
+    for index_raw, value_raw in _ENUMERATED_NUMBER_PAIR_RE.findall(normalized):
+        index = _canonical_number_token(index_raw)
+        value = _canonical_number_token(value_raw)
+        if not index or not value:
+            continue
+        pairs[index] = value
+    return tuple(pairs.items())
+
+
+@lru_cache(maxsize=8192)
+def _extract_hour_ranges_cached(text: str) -> Tuple[Tuple[str, str], ...]:
+    normalized = _normalize_for_number_patterns(text)
+    ranges: List[Tuple[str, str]] = []
+    for start_raw, end_raw in _HOUR_RANGE_RE.findall(normalized):
+        start = _canonical_number_token(start_raw)
+        end = _canonical_number_token(end_raw)
+        if start and end:
+            ranges.append((start, end))
+    return tuple(ranges)
+
+
 def _check_number_consistency(script_text: str, raw_text: str) -> bool:
     """
     Luật thép Nâng cấp: Các con số trong kịch bản phải xuất hiện
     ĐÚNG THỨ TỰ và LIÊN TIẾP NHAU trong audio thực tế.
     """
+    semantic_check_applied = False
+
+    script_hour_ranges = set(_extract_hour_ranges_cached(script_text))
+    if script_hour_ranges:
+        semantic_check_applied = True
+        raw_hour_ranges = set(_extract_hour_ranges_cached(raw_text))
+        if not script_hour_ranges.issubset(raw_hour_ranges):
+            return False
+
+    script_number_pairs_seq = _extract_enumerated_number_pairs_cached(script_text)
+    script_number_pairs = dict(script_number_pairs_seq)
+    if len(script_number_pairs) >= 2:
+        semantic_check_applied = True
+        raw_number_pairs_seq = _extract_enumerated_number_pairs_cached(raw_text)
+        raw_number_pairs = dict(raw_number_pairs_seq)
+        for index, value in script_number_pairs.items():
+            if raw_number_pairs.get(index) != value:
+                return False
+
+        raw_index_position: Dict[str, int] = {}
+        for pos, (index, _) in enumerate(raw_number_pairs_seq):
+            if index not in raw_index_position:
+                raw_index_position[index] = pos
+        script_indices_in_order = [index for index, _ in script_number_pairs_seq]
+        raw_positions = [raw_index_position.get(index, -1) for index in script_indices_in_order]
+        if any(pos < 0 for pos in raw_positions):
+            return False
+        if any(raw_positions[i] >= raw_positions[i + 1] for i in range(len(raw_positions) - 1)):
+            return False
+
+    if semantic_check_applied:
+        return True
+
     script_nums = _extract_nums_cached(script_text)
     if not script_nums:
         return True
 
     raw_nums = _extract_nums_cached(raw_text)
+
+    # Loại bỏ các số lặp liên tiếp do đơn vị như "/100ml" xuất hiện lặp trong script.
+    deduped_script = [script_nums[0]]
+    for num in script_nums[1:]:
+        if num != deduped_script[-1]:
+            deduped_script.append(num)
+    script_nums = tuple(deduped_script)
 
     n = len(script_nums)
     for i in range(len(raw_nums) - n + 1):
